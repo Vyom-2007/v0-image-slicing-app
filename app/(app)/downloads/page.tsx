@@ -4,6 +4,7 @@ import { useState, useEffect } from "react"
 import { Header } from "@/components/app/header"
 import { PLATFORMS, type PlatformKey, formatBytes } from "@/lib/constants"
 import { Progress } from "@/components/ui/progress"
+import { Button } from "@/components/ui/button"
 import { FileVideo, CheckCircle2, XCircle, Clock } from "lucide-react"
 
 interface MediaItem {
@@ -21,18 +22,23 @@ interface MediaItem {
 
 export default function DownloadsPage() {
     const [items, setItems] = useState<MediaItem[]>([])
+    const [page, setPage] = useState(1)
+    const [totalPages, setTotalPages] = useState(1)
 
     useEffect(() => {
         function load() {
-            fetch("/api/media?source=download&limit=50")
+            fetch(`/api/media?source=download&limit=20&page=${page}`)
                 .then((r) => r.json())
-                .then((d) => setItems(d.items || []))
+                .then((d) => {
+                    setItems(d.items || [])
+                    setTotalPages(d.totalPages || 1)
+                })
                 .catch(console.error)
         }
         load()
         const interval = setInterval(load, 3000) // Poll for active downloads
         return () => clearInterval(interval)
-    }, [])
+    }, [page])
 
     const active = items.filter((i) => i.status === "downloading")
     const completed = items.filter((i) => i.status === "completed")
@@ -118,6 +124,13 @@ export default function DownloadsPage() {
                                     })}
                                 </tbody>
                             </table>
+                            {totalPages > 1 && (
+                                <div className="p-3 border-t border-border flex items-center justify-between bg-muted/10">
+                                    <Button disabled={page <= 1} onClick={() => setPage(page - 1)} variant="outline" size="sm">Previous</Button>
+                                    <span className="text-xs text-muted-foreground">Page {page} of {totalPages}</span>
+                                    <Button disabled={page >= totalPages} onClick={() => setPage(page + 1)} variant="outline" size="sm">Next</Button>
+                                </div>
+                            )}
                         </div>
                     )}
                 </div>

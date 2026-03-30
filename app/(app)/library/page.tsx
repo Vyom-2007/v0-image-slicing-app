@@ -25,17 +25,24 @@ export default function LibraryPage() {
     const [platformFilter, setPlatformFilter] = useState("all")
     const [view, setView] = useState<"grid" | "list">("grid")
     const [total, setTotal] = useState(0)
+    const [page, setPage] = useState(1)
+    const [totalPages, setTotalPages] = useState(1)
 
     function loadMedia() {
-        let url = `/api/media?source=${source}&limit=50`
+        let url = `/api/media?source=${source}&limit=20&page=${page}`
         if (platformFilter !== "all") url += `&platform=${platformFilter}`
         fetch(url)
             .then((r) => r.json())
-            .then((d) => { setItems(d.items || []); setTotal(d.total || 0) })
+            .then((d) => {
+                setItems(d.items || [])
+                setTotal(d.total || 0)
+                setTotalPages(d.totalPages || 1)
+            })
             .catch(console.error)
     }
 
-    useEffect(() => { loadMedia() }, [source, platformFilter])
+    useEffect(() => { setPage(1) }, [source, platformFilter])
+    useEffect(() => { loadMedia() }, [source, platformFilter, page])
 
     async function handleDelete(id: string) {
         await fetch(`/api/media?id=${id}`, { method: "DELETE" })
@@ -146,6 +153,14 @@ export default function LibraryPage() {
                                 </div>
                             )
                         })}
+                    </div>
+                )}
+
+                {totalPages > 1 && (
+                    <div className="flex items-center justify-between pt-4">
+                        <Button disabled={page <= 1} onClick={() => setPage(page - 1)} variant="outline">Previous</Button>
+                        <span className="text-sm text-muted-foreground">Page {page} of {totalPages}</span>
+                        <Button disabled={page >= totalPages} onClick={() => setPage(page + 1)} variant="outline">Next</Button>
                     </div>
                 )}
             </div>

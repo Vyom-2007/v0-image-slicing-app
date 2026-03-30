@@ -12,18 +12,25 @@ import {
 } from "@/lib/session-manager"
 import { stepDelay, actionDelay, humanType } from "@/lib/human-delay"
 
-// Dynamic imports to avoid SSR issues with Playwright
+// Bypass Next.js webpack bundling which breaks CJS plugin utilities
+let stealthApplied = false
 async function getPlaywright() {
-    const { chromium } = await import("playwright-extra")
-    const StealthPlugin = (await import("puppeteer-extra-plugin-stealth")).default
-    chromium.use(StealthPlugin())
+    // Dynamic eval bypasses the bundler completely
+    const req = typeof eval !== "undefined" ? eval("require") : require
+    const { chromium } = req("playwright-extra")
+    const StealthPlugin = req("puppeteer-extra-plugin-stealth")
+    
+    if (!stealthApplied) {
+        chromium.use(StealthPlugin())
+        stealthApplied = true
+    }
     return chromium
 }
 
 const TIKTOK_UPLOAD_URL = "https://www.tiktok.com/upload?lang=en"
 
 /** Check if a CAPTCHA is visible on the current page */
-async function isCaptchaVisible(page: Awaited<ReturnType<Awaited<ReturnType<typeof getPlaywright>>["launch"]>>["newPage"] extends () => Promise<infer P> ? P : never): Promise<boolean> {
+async function isCaptchaVisible(page: any): Promise<boolean> {
     const selectors = [".captcha-container", "#captcha_container", "[data-e2e='captcha']", ".secsdk-captcha-drag-icon"]
     for (const sel of selectors) {
         try {
@@ -35,7 +42,7 @@ async function isCaptchaVisible(page: Awaited<ReturnType<Awaited<ReturnType<type
 }
 
 /** Wait up to 5 minutes for user to solve CAPTCHA manually */
-async function waitForCaptchaSolve(page: Parameters<typeof isCaptchaVisible>[0]): Promise<boolean> {
+async function waitForCaptchaSolve(page: any): Promise<boolean> {
     const maxWait = 5 * 60 * 1000 // 5 minutes
     const pollInterval = 3000
     const deadline = Date.now() + maxWait
