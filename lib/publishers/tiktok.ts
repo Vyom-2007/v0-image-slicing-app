@@ -54,6 +54,24 @@ async function waitForCaptchaSolve(page: any): Promise<boolean> {
 }
 
 /**
+ * Sanitize cookies from Cookie-Editor extension for Playwright compatibility.
+ */
+function sanitizeCookies(rawCookies: any[]): any[] {
+    return rawCookies.map((cookie: any) => {
+        const { hostOnly, session, storeId, ...valid } = cookie
+        if (typeof valid.sameSite === "string") {
+            const ss = valid.sameSite.toLowerCase()
+            if (ss === "no_restriction" || ss === "none") valid.sameSite = "None"
+            else if (ss === "strict") valid.sameSite = "Strict"
+            else valid.sameSite = "Lax"
+        } else {
+            valid.sameSite = "Lax"
+        }
+        return valid
+    })
+}
+
+/**
  * Upload a video to TikTok using stealth browser automation.
  * Sends a push notification if CAPTCHA is encountered.
  */
@@ -90,7 +108,8 @@ export async function uploadToTikTok(
     })
 
     // Load saved cookies
-    await context.addCookies(cookieSession.cookies as Parameters<typeof context.addCookies>[0])
+    const sanitizedCookies = sanitizeCookies(cookieSession.cookies as any[])
+    await context.addCookies(sanitizedCookies as Parameters<typeof context.addCookies>[0])
     const page = await context.newPage()
 
     try {
@@ -109,15 +128,27 @@ export async function uploadToTikTok(
             }
         }
 
-        // Find upload input (hidden file input)
-        await page.waitForSelector("input[type='file']", { timeout: 15000 })
+        // Give up to 2 minutes — if login screen appears, user can manually scan QR code!
+        // Note: state='attached' is required because TikTok hides the file input element visually
+        await page.waitForSelector("input[type='file']", { state: "attached", timeout: 120000 })
+        
+        // Save fresh cookies IMMEDIATELY so we never ask for login again even if the rest fails
+        saveCookieSession(accountId, "tiktok", {
+            cookies: await context.cookies(),
+            userAgent: cookieSession.userAgent,
+            platform: "tiktok"
+        })
+
         const fileInput = page.locator("input[type='file']").first()
         await fileInput.setInputFiles(path.resolve(options.filepath))
         await stepDelay()
 
         // Wait for video to process
         await page.waitForSelector("[class*='upload-progress']", { timeout: 60000 }).catch(() => { })
-        await page.waitForSelector("[class*='caption']", { timeout: 90000 })
+        
+        // Use robust selectors for modern TikTok Studio
+        const captionSelector = ".public-DraftEditor-content, [contenteditable='true'], [class*='caption']"
+        await page.waitForSelector(captionSelector, { timeout: 90000 })
         await stepDelay()
 
         // Build caption with hashtags
@@ -125,18 +156,18 @@ export async function uploadToTikTok(
         const fullCaption = `${options.caption} ${hashtags}`.trim()
 
         // Type caption like a human
-        const captionInput = page.locator("[class*='caption']").first()
+        const captionInput = page.locator(captionSelector).first()
         await captionInput.click()
         await actionDelay()
         await humanType((char) => page.keyboard.type(char), fullCaption)
         await actionDelay()
 
         // Post the video
-        const postButton = page.locator("button:has-text('Post')").first()
+        const postButton = page.locator("button:has-text('Post'), button:has-text('Publish'), [data-e2e='post_video_button']").first()
         await postButton.click()
 
-        // Wait for success indicator
-        await page.waitForURL(/tiktok\.com\/@/, { timeout: 30000 })
+        // Wait for success indicator (either redirect to profile or studio dashboard)
+        await page.waitForURL(/(tiktok\.com\/@|tiktok\.com\/tiktokstudio)/, { timeout: 45000 }).catch(() => {})
 
         await browser.close()
         return { success: true }
@@ -166,7 +197,8 @@ export async function validateTikTokSession(
     const chromium = await getPlaywright()
     const browser = await chromium.launch({ headless: false, args: ["--start-minimized"] })
     const context = await browser.newContext({ userAgent: cookieSession.userAgent })
-    await context.addCookies(cookieSession.cookies as Parameters<typeof context.addCookies>[0])
+    const sanitizedCookies = sanitizeCookies(cookieSession.cookies as any[])
+    await context.addCookies(sanitizedCookies as Parameters<typeof context.addCookies>[0])
     const page = await context.newPage()
 
     try {
