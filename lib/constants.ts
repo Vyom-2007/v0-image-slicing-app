@@ -10,6 +10,7 @@ import {
     Music2,
     Instagram,
     Twitter,
+    Images,
     type LucideIcon,
 } from "lucide-react"
 
@@ -64,6 +65,7 @@ export const NAV_ITEMS: NavItem[] = [
     { icon: LayoutDashboard, label: "Dashboard", href: "/", matchExact: true },
     { icon: Users, label: "Accounts", href: "/accounts" },
     { icon: FolderOpen, label: "Library", href: "/library" },
+    { icon: Images, label: "Gallery", href: "/gallery" },
     { icon: CalendarDays, label: "Calendar", href: "/calendar" },
     { icon: BarChart3, label: "Analytics", href: "/analytics" },
     { icon: Download, label: "Downloads", href: "/downloads" },

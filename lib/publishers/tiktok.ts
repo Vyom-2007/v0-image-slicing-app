@@ -90,8 +90,17 @@ export async function uploadToTikTok(
 
     const chromium = await getPlaywright()
 
-    const browser = await chromium.launch({
+    const fs = require("fs")
+    const sessionDir = path.join(process.cwd(), "cookie-sessions", `tiktok_${accountId}`)
+    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true })
+
+    // Use a PERSISTENT context so TikTok Local Storage, Cache, and IndexedDB is fully retained!
+    const context = await chromium.launchPersistentContext(sessionDir, {
         headless: false, // REQUIRED — TikTok detects headless mode
+        userAgent: cookieSession.userAgent,
+        viewport: { width: 1280, height: 720 },
+        locale: "en-US",
+        timezoneId: Intl.DateTimeFormat().resolvedOptions().timeZone,
         args: [
             "--start-minimized",
             "--no-first-run",
@@ -99,18 +108,14 @@ export async function uploadToTikTok(
         ],
     })
 
-    const context = await browser.newContext({
-        userAgent: cookieSession.userAgent,
-        viewport: { width: 1280, height: 720 },
-        // Match real system locale/timezone
-        locale: "en-US",
-        timezoneId: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    })
+    // Persistent context auto-opens one blank page
+    const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage()
 
-    // Load saved cookies
+    // Inject cookies as backup (persistent context mostly handles this naturally)
     const sanitizedCookies = sanitizeCookies(cookieSession.cookies as any[])
-    await context.addCookies(sanitizedCookies as Parameters<typeof context.addCookies>[0])
-    const page = await context.newPage()
+    if (sanitizedCookies.length > 0) {
+        await context.addCookies(sanitizedCookies as Parameters<typeof context.addCookies>[0]).catch(() => {})
+    }
 
     try {
         // Navigate to TikTok upload page
@@ -123,14 +128,41 @@ export async function uploadToTikTok(
             console.log("[TikTok] CAPTCHA detected — pausing for user to solve...")
             const solved = await waitForCaptchaSolve(page)
             if (!solved) {
-                await browser.close()
+                await context.close()
                 return { success: false, error: "CAPTCHA not solved within 5 minutes. Upload cancelled." }
             }
         }
 
-        // Give up to 2 minutes — if login screen appears, user can manually scan QR code!
-        // Note: state='attached' is required because TikTok hides the file input element visually
-        await page.waitForSelector("input[type='file']", { state: "attached", timeout: 120000 })
+        // Give up to 3 minutes — if login screen appears, user can manually scan QR code!
+        let isFileInputReady = false
+        const loginMaxWait = Date.now() + 180000 // 3 minutes
+        
+        console.log("[TikTok] Waiting up to 3 mins for login or file input...")
+        while (Date.now() < loginMaxWait) {
+            const count = await page.locator("input[type='file']").count().catch(() => 0)
+            if (count > 0) {
+                isFileInputReady = true
+                break
+            }
+            
+            const currentUrl = page.url()
+            // If the user logged in and TikTok dropped them on the main feed instead of the upload page:
+            if (!currentUrl.includes("upload") && !currentUrl.includes("login") && !currentUrl.includes("passport")) {
+                console.log("[TikTok] Redirected away from upload. Forcing back to TikTok Studio...")
+                await page.goto(TIKTOK_UPLOAD_URL, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {})
+                await stepDelay()
+            }
+            
+            await new Promise((r) => setTimeout(r, 2000))
+        }
+
+        if (!isFileInputReady) {
+            await context.close()
+            return { success: false, error: "Timed out waiting for login to complete (3 minutes limit)." }
+        }
+
+        // Ensure it's fully attached
+        await page.waitForSelector("input[type='file']", { state: "attached", timeout: 15000 })
         
         // Save fresh cookies IMMEDIATELY so we never ask for login again even if the rest fails
         saveCookieSession(accountId, "tiktok", {
@@ -143,8 +175,13 @@ export async function uploadToTikTok(
         await fileInput.setInputFiles(path.resolve(options.filepath))
         await stepDelay()
 
-        // Wait for video to process
-        await page.waitForSelector("[class*='upload-progress']", { timeout: 60000 }).catch(() => { })
+        // Wait for video to start uploading
+        const progressSelector = "[class*='upload-progress'], [class*='uploading-text'], [class*='uploading-stage']"
+        await page.waitForSelector(progressSelector, { state: "attached", timeout: 10000 }).catch(() => { })
+        
+        // Wait up to 3 minutes for the video upload to finish! (The progress indicator must disappear)
+        console.log("[TikTok] Video uploading... Waiting for 100% completion...")
+        await page.waitForSelector(progressSelector, { state: "hidden", timeout: 180000 })
         
         // Use robust selectors for modern TikTok Studio
         const captionSelector = ".public-DraftEditor-content, [contenteditable='true'], [class*='caption']"
@@ -163,13 +200,48 @@ export async function uploadToTikTok(
         await actionDelay()
 
         // Post the video
-        const postButton = page.locator("button:has-text('Post'), button:has-text('Publish'), [data-e2e='post_video_button']").first()
-        await postButton.click()
+        const postButton = page.locator("button:text-is('Post'), button:text-is('Publish'), [data-e2e='post_video_button'], button[class*='post']").locator('visible=true').first()
+        await postButton.scrollIntoViewIfNeeded()
+        await actionDelay()
+        
+        // TikTok sometimes sets weird z-index or overlay blockers. Force the click.
+        await postButton.click({ force: true })
 
-        // Wait for success indicator (either redirect to profile or studio dashboard)
-        await page.waitForURL(/(tiktok\.com\/@|tiktok\.com\/tiktokstudio)/, { timeout: 45000 }).catch(() => {})
+        console.log("[TikTok] Clicked post. Handling post flow...")
 
-        await browser.close()
+        // Handle possible secondary modals (like the Copyright 'Continue to post' warning)
+        let isSuccess = false
+        const maxWait = Date.now() + 45000
+        const successSelectors = "text='Manage your posts', text='Upload another video', [class*='upload-success']"
+        const confirmBtn = page.locator("button:has-text('Continue to post'), button:has-text('Post anyway'), button:has-text('Continue')")
+
+        while (Date.now() < maxWait) {
+            // Check for success URL redirect
+            if (page.url().includes("tiktok.com/@")) {
+                isSuccess = true
+                break
+            }
+            // Check for success Modal
+            if (await page.locator(successSelectors).isVisible().catch(() => false)) {
+                isSuccess = true
+                break
+            }
+
+            // If TikTok throws a "Run copyright check?" modal, instantly click "Continue to post"!
+            if (await confirmBtn.first().isVisible().catch(() => false)) {
+                console.log("[TikTok] Bypassing secondary copyright confirmation modal...")
+                await confirmBtn.first().click({ force: true }).catch(() => {})
+                await stepDelay()
+            }
+
+            await new Promise((r) => setTimeout(r, 1500))
+        }
+
+        if (!isSuccess) {
+            throw new Error("Failed to confirm publication. TikTok did not show a success message.")
+        }
+
+        await context.close()
         return { success: true }
     } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err)
@@ -179,7 +251,7 @@ export async function uploadToTikTok(
             markSessionExpired(accountId, "tiktok")
         }
 
-        await browser.close()
+        await context.close()
         return { success: false, error: errorMsg }
     }
 }
@@ -194,12 +266,24 @@ export async function validateTikTokSession(
     const cookieSession = loadCookies(accountId, "tiktok")
     if (!cookieSession) return { valid: false }
 
+    const fs = require("fs")
+    const sessionDir = path.join(process.cwd(), "cookie-sessions", `tiktok_${accountId}`)
+    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true })
+
     const chromium = await getPlaywright()
-    const browser = await chromium.launch({ headless: false, args: ["--start-minimized"] })
-    const context = await browser.newContext({ userAgent: cookieSession.userAgent })
+    const context = await chromium.launchPersistentContext(sessionDir, { 
+        headless: false, 
+        userAgent: cookieSession.userAgent,
+        args: ["--start-minimized", "--disable-blink-features=AutomationControlled"]
+    })
+    
+    // Persistent auto-opens one tab
+    const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage()
+    
     const sanitizedCookies = sanitizeCookies(cookieSession.cookies as any[])
-    await context.addCookies(sanitizedCookies as Parameters<typeof context.addCookies>[0])
-    const page = await context.newPage()
+    if (sanitizedCookies.length > 0) {
+        await context.addCookies(sanitizedCookies as Parameters<typeof context.addCookies>[0]).catch(() => {})
+    }
 
     try {
         await page.goto("https://www.tiktok.com/", { waitUntil: "domcontentloaded", timeout: 20000 })
@@ -209,7 +293,7 @@ export async function validateTikTokSession(
 
         // Capture fresh cookies after navigation (extends session)
         const freshCookies = await context.cookies()
-        await browser.close()
+        await context.close()
 
         if (isLoggedIn) {
             saveCookieSession(accountId, "tiktok", {
@@ -223,7 +307,7 @@ export async function validateTikTokSession(
         markSessionExpired(accountId, "tiktok")
         return { valid: false }
     } catch {
-        await browser.close()
+        await context.close()
         return { valid: false }
     }
 }
